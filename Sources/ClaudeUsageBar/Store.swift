@@ -35,6 +35,9 @@ final class Store {
 
     private let claude = ClaudeAPI()
     private let codex = CodexAPI()
+    private let kimi = KimiAPI()
+    private let sub2api = Sub2API()
+    private let grok = GrokAPI()
 
     init() {
         Task { await pollLoop() }
@@ -67,7 +70,8 @@ final class Store {
     private func refresh(_ id: String) async {
         guard var a = accounts.first(where: { $0.id == id }) else { return }
         do {
-            if a.expiresAt < .now.addingTimeInterval(120) {
+            let oauth = a.provider == .claude || a.provider == .codex
+            if oauth, a.expiresAt < .now.addingTimeInterval(120) {
                 let t = try await a.provider == .claude ? claude.refresh(a.refreshToken) : codex.refresh(a.refreshToken)
                 a.accessToken = t.accessToken
                 a.refreshToken = t.refreshToken ?? a.refreshToken
@@ -77,6 +81,9 @@ final class Store {
             let usage = switch a.provider {
             case .claude: try await claude.usage(accessToken: a.accessToken)
             case .codex: try await codex.usage(accessToken: a.accessToken, accountID: a.id)
+            case .kimi: try await kimi.usage(apiKey: a.accessToken)
+            case .sub2api: try await sub2api.usage(baseURL: a.baseURL ?? "", apiKey: a.accessToken).usage
+            case .grok: try await grokUsage()
             }
             status[id] = Status(usage: usage)
         } catch let e as APIError {
@@ -99,6 +106,14 @@ final class Store {
             let pkce = PKCE()
             let account: Account
             switch provider {
+            case .kimi, .sub2api:
+                return
+            case .grok:
+                guard let c = GrokCredential.load() else {
+                    throw LoginError("未找到 grok CLI 登录（~/.grok/auth.json），先在终端运行 grok login")
+                }
+                account = Account(provider: .grok, id: "grok:\(c.userID)", name: c.email ?? "Grok",
+                                  accessToken: "", refreshToken: "", expiresAt: .distantFuture)
             case .claude:
                 let (code, redirect) = try await authorize(pkce: pkce, ports: [nil], path: ClaudeOAuth.callbackPath) {
                     ClaudeOAuth.authorizeURL(pkce: pkce, redirectURI: "http://localhost:\($0)\(ClaudeOAuth.callbackPath)")
@@ -170,6 +185,49 @@ final class Store {
     }
 
     func cancelLogin() { loginServer?.stop() }
+
+    private func grokUsage() async throws -> Usage {
+        guard let c = GrokCredential.load() else { throw LoginError("未找到 grok 登录，请在终端运行 grok login") }
+        if let e = c.expiresAt, e < .now { throw LoginError("grok 登录已过期，运行一次 grok 即可续期") }
+        return try await grok.usage(accessToken: c.accessToken)
+    }
+
+    /// Validates the key against the usage endpoint before saving it. Returns whether it was added.
+    func addKeyAccount(_ provider: Provider, key rawKey: String, baseURL rawBase: String) async -> Bool {
+        loginError = nil
+        let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            loginError = "API key 为空"
+            return false
+        }
+        do {
+            let name: String
+            var base: String?
+            switch provider {
+            case .kimi:
+                _ = try await kimi.usage(apiKey: key)
+                name = "Kimi Code ··\(key.suffix(4))"
+            case .sub2api:
+                guard let b = Sub2API.normalize(baseURL: rawBase) else {
+                    loginError = "地址需要是 https://…（本机部署可用 http://127.0.0.1:端口）"
+                    return false
+                }
+                let plan = try await sub2api.usage(baseURL: b, apiKey: key).planName
+                base = b
+                name = "\(plan ?? URL(string: b)?.host ?? "sub2api") ··\(key.suffix(4))"
+            case .claude, .codex, .grok:
+                return false
+            }
+            let a = Account(provider: provider, id: keyAccountID(provider, key), name: name, accessToken: key,
+                            refreshToken: "", expiresAt: .distantFuture, baseURL: base)
+            upsert(a)
+            await refresh(a.id)
+            return true
+        } catch {
+            loginError = "验证失败：\(error.localizedDescription)"
+            return false
+        }
+    }
 
     func move(_ id: String, onto target: String) {
         accounts.move(id: id, onto: target)

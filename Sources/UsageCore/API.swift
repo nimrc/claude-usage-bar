@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct APIError: LocalizedError, Sendable {
@@ -128,16 +129,117 @@ public struct CodexAPI: Sendable {
     }
 }
 
+public struct KimiAPI: Sendable {
+    public static let usageURL = URL(string: "https://api.kimi.com/coding/v1/usages")!
+    let http: HTTP
+
+    public init(session: URLSession = .shared) { http = HTTP(session: session) }
+
+    public func usage(apiKey: String) async throws -> Usage {
+        var req = URLRequest(url: Self.usageURL, timeoutInterval: 20)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        let wire: KimiUsageWire = try await http.send(req)
+        return wire.parsed
+    }
+}
+
+public struct Sub2API: Sendable {
+    let http: HTTP
+
+    public init(session: URLSession = .shared) { http = HTTP(session: session) }
+
+    /// HTTPS, or plain HTTP on loopback only, so a key never crosses the network in clear text.
+    public static func normalize(baseURL: String) -> String? {
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
+        guard let c = URLComponents(string: trimmed), let host = c.host, c.query == nil, c.fragment == nil,
+              c.user == nil, c.password == nil else { return nil }
+        let loopback = host == "localhost" || host == "127.0.0.1" || host == "::1"
+        guard c.scheme == "https" || (c.scheme == "http" && loopback) else { return nil }
+        return trimmed
+    }
+
+    public func usage(baseURL: String, apiKey: String) async throws -> (usage: Usage, planName: String?) {
+        guard let url = URL(string: baseURL + "/v1/usage") else { throw APIError(status: 0, body: "地址无效") }
+        var req = URLRequest(url: url, timeoutInterval: 20)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        let wire: Sub2APIUsageWire = try await http.send(req)
+        return (wire.parsed, wire.planName)
+    }
+}
+
+public struct GrokAPI: Sendable {
+    public static let billingURL = URL(string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits")!
+    let http: HTTP
+
+    public init(session: URLSession = .shared) { http = HTTP(session: session) }
+
+    public func usage(accessToken: String) async throws -> Usage {
+        var req = URLRequest(url: Self.billingURL, timeoutInterval: 20)
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("xai-grok-cli", forHTTPHeaderField: "x-xai-token-auth")
+        guard let usage = parseGrokBilling(try await http.data(req)) else {
+            throw APIError(status: 200, body: "无法解析 Grok 用量")
+        }
+        return usage
+    }
+}
+
+/// The grok CLI's own login, read fresh on every poll and never written: the CLI
+/// refreshes it, and rotating its refresh token here would log the CLI out.
+public struct GrokCredential: Sendable, Equatable {
+    public let accessToken: String
+    public let userID: String
+    public let email: String?
+    public let expiresAt: Date?
+
+    public static var authFile: URL {
+        let home = ProcessInfo.processInfo.environment["GROK_HOME"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".grok")
+        return home.appending(path: "auth.json")
+    }
+
+    public static func load(from url: URL = authFile) -> GrokCredential? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return parse(data)
+    }
+
+    static func parse(_ data: Data) -> GrokCredential? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let keys = root.keys.sorted()
+        let scope = keys.first { $0.hasPrefix("https://auth.x.ai") } ?? keys.first { $0.hasPrefix("https://accounts.x.ai") }
+        guard let scope, let entry = root[scope] as? [String: Any], let token = entry["key"] as? String, !token.isEmpty else { return nil }
+        let expiry: Date? = switch entry["expires_at"] {
+        case let s as String: parseISODate(s) ?? Double(s).map { Date(timeIntervalSince1970: $0 > 1e12 ? $0 / 1000 : $0) }
+        case let n as NSNumber: Date(timeIntervalSince1970: n.doubleValue > 1e12 ? n.doubleValue / 1000 : n.doubleValue)
+        default: nil
+        }
+        let user = entry["user_id"] as? String ?? entry["team_id"] as? String ?? "default"
+        return GrokCredential(accessToken: token, userID: user, email: entry["email"] as? String, expiresAt: expiry)
+    }
+}
+
+/// Stable account id for an API key without storing the key in the id.
+public func keyAccountID(_ provider: Provider, _ key: String) -> String {
+    let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+    return "\(provider.rawValue):\(digest.prefix(16))"
+}
+
 struct HTTP: Sendable {
     let session: URLSession
 
     func send<T: Decodable>(_ req: URLRequest) async throws -> T {
+        try Self.decoder.decode(T.self, from: try await data(req))
+    }
+
+    func data(_ req: URLRequest) async throws -> Data {
+        var req = req
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, resp) = try await session.data(for: req)
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else {
             throw APIError(status: status, body: String(decoding: data, as: UTF8.self))
         }
-        return try Self.decoder.decode(T.self, from: data)
+        return data
     }
 
     static let decoder: JSONDecoder = {
