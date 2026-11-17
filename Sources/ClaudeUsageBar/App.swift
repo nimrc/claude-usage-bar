@@ -4,12 +4,20 @@ import UsageCore
 @main
 enum Entry {
     @MainActor static func main() {
-        if CommandLine.arguments.contains("--status") {
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
+            Task {
+                await snapshot(to: args[i + 1])
+                exit(0)
+            }
+            RunLoop.main.run()
+        }
+        if args.contains("--status") {
             Task {
                 await printStatus()
                 exit(0)
             }
-            dispatchMain()
+            RunLoop.main.run()
         }
         ClaudeUsageBarApp.main()
     }
@@ -50,6 +58,30 @@ func printStatus() async {
     }
 }
 
+/// Renders the panel with live usage to a PNG and prints its size, using the
+/// saved display settings (compact, hidden names). Read-only like `--status`.
+@MainActor func snapshot(to path: String) async {
+    _ = NSApplication.shared
+    let store = Store(readOnly: true)
+    await store.refreshAll()
+    let host = NSHostingView(rootView: UsagePanel(store: store))
+    let window = NSWindow(contentRect: NSRect(origin: .zero, size: host.fittingSize), styleMask: [.borderless],
+                          backing: .buffered, defer: false)
+    window.contentView = host
+    // The list height is measured on the first layout pass; let it settle before capturing.
+    for _ in 0..<3 {
+        host.layoutSubtreeIfNeeded()
+        try? await Task.sleep(for: .milliseconds(200))
+    }
+    let size = host.fittingSize
+    window.setContentSize(size)
+    host.layoutSubtreeIfNeeded()
+    guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
+    host.cacheDisplay(in: host.bounds, to: rep)
+    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+    print("panel \(Int(size.width))x\(Int(size.height)) pt, screen \(Int(NSScreen.main?.visibleFrame.height ?? 0)) pt")
+}
+
 struct ClaudeUsageBarApp: App {
     @State private var store = Store()
 
@@ -68,6 +100,11 @@ struct UsagePanel: View {
     @AppStorage("hideNames") private var hideNames = false
     @AppStorage("compact") private var compact = false
     @State private var keyForm: Provider?
+    @State private var listHeight: CGFloat = 0
+    @State private var panelHeight: CGFloat = 0
+
+    /// Leaves room for the header and footer so the panel never outgrows the screen.
+    private var maxListHeight: CGFloat { (NSScreen.main?.visibleFrame.height ?? 800) - 160 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? 6 : 10) {
@@ -104,9 +141,16 @@ struct UsagePanel: View {
                 Text("还没有账号。点「添加账号」选择服务商。")
                     .font(.callout).foregroundStyle(.secondary)
             }
-            ForEach(store.accounts) { account in
-                AccountCard(account: account, status: store.status[account.id], store: store, hideName: hideNames, compact: compact)
+            ScrollView {
+                VStack(spacing: compact ? 6 : 10) {
+                    ForEach(store.accounts) { account in
+                        AccountCard(account: account, status: store.status[account.id], store: store,
+                                    hideName: hideNames, compact: compact)
+                    }
+                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { listHeight = $0 }
             }
+            .frame(height: min(listHeight, maxListHeight))
 
             if let provider = keyForm {
                 KeyForm(provider: provider, store: store) { keyForm = nil }
@@ -140,6 +184,9 @@ struct UsagePanel: View {
         }
         .padding(14)
         .frame(width: 380)
+        .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { panelHeight = $0 }
+        .background(WindowHeight(height: panelHeight))
         .onAppear { store.refreshIfStale() }
     }
 }
@@ -271,6 +318,28 @@ struct AccountCard: View {
     }
 }
 
+/// MenuBarExtra windows grow with their content but do not shrink back, so a
+/// switch to compact mode would leave an empty, screen-tall panel. Pin the
+/// window to the content height, keeping its top edge under the menu bar.
+struct WindowHeight: NSViewRepresentable {
+    let height: CGFloat
+
+    func makeNSView(context: Context) -> NSView { NSView() }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        let height = height
+        DispatchQueue.main.async {
+            guard height > 0, let window = view.window else { return }
+            var frame = window.frame
+            let delta = height - window.contentRect(forFrameRect: frame).height
+            guard abs(delta) > 0.5 else { return }
+            frame.origin.y -= delta
+            frame.size.height += delta
+            window.setFrame(frame, display: true)
+        }
+    }
+}
+
 struct LimitRow: View {
     let limit: Limit
 
@@ -296,7 +365,8 @@ struct MiniBar: View {
             ProgressView(value: min(limit.percent, 100), total: 100).tint(limit.tint).frame(width: 40)
             Text("\(Int(limit.percent.rounded()))%")
                 .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-                .frame(width: 28, alignment: .trailing)
+                .lineLimit(1)
+                .frame(width: 32, alignment: .trailing)
         }
         .help("\(limit.title) · \(limit.resetDate.flatMap { countdown(to: $0) }.map { "\($0)后重置" } ?? "无重置时间")")
     }

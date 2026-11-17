@@ -39,8 +39,13 @@ final class Store {
     private let sub2api = Sub2API()
     private let grok = GrokAPI()
 
-    init() {
-        Task { await pollLoop() }
+    /// Read-only stores (CLI snapshots) never refresh tokens or write the keychain,
+    /// so they cannot rotate a refresh token out from under the running app.
+    private let readOnly: Bool
+
+    init(readOnly: Bool = false) {
+        self.readOnly = readOnly
+        if !readOnly { Task { await pollLoop() } }
     }
 
     private func pollLoop() async {
@@ -71,7 +76,7 @@ final class Store {
         guard var a = accounts.first(where: { $0.id == id }) else { return }
         do {
             let oauth = a.provider == .claude || a.provider == .codex
-            if oauth, a.expiresAt < .now.addingTimeInterval(120) {
+            if oauth, !readOnly, a.expiresAt < .now.addingTimeInterval(120) {
                 let t = try await a.provider == .claude ? claude.refresh(a.refreshToken) : codex.refresh(a.refreshToken)
                 a.accessToken = t.accessToken
                 a.refreshToken = t.refreshToken ?? a.refreshToken
@@ -261,6 +266,7 @@ final class Store {
     }
 
     private func persist() {
+        guard !readOnly else { return }
         do { try Vault.save(accounts) } catch { loginError = "保存到钥匙串失败：\(error.localizedDescription)" }
     }
 }

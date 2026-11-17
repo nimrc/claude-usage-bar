@@ -10,7 +10,7 @@ macOS menu bar app that shows plan usage for several Claude Code, Codex, Kimi Co
 make install   # builds dist/ClaudeUsageBar.app, copies it to /Applications, launches it
 ```
 
-Requires macOS 14+ and a Swift 6 toolchain.
+Requires macOS 15+ and a Swift 6 toolchain.
 
 ## Accounts
 
@@ -28,7 +28,7 @@ OAuth accounts are keyed by Claude organization or ChatGPT account, so several u
 
 Refresh tokens and API keys live in the login keychain (`com.nimrc.claude-usage-bar`). The app never writes the Claude Code, Codex or grok CLI credentials; Grok's token is renewed by the grok CLI, so an unused CLI eventually shows as expired. Usage refreshes every 5 minutes and when the panel opens.
 
-The eye switch blurs account names for screenshots. Drag a card onto another to reorder.
+The eye switch blurs account names for screenshots. The compact button shows one row per account (first two windows as mini bars; click a row for details). **⋯ → 重命名…** sets a short alias. Drag a card onto another to reorder. The list scrolls once it would outgrow the screen.
 
 ## CLI
 
@@ -37,6 +37,12 @@ The eye switch blurs account names for screenshots. Drag a card onto another to 
 ```
 
 Prints every account's limits. Read-only: it uses the stored access tokens and never refreshes them, so it cannot invalidate the running app's refresh tokens.
+
+```sh
+ClaudeUsageBar --snapshot panel.png [-compact YES|NO] [-hideNames YES|NO]
+```
+
+Renders the panel with live usage to a PNG (same read-only rules) and prints its size; the `-key value` pairs override the saved display settings for that run only.
 
 ## Development
 
