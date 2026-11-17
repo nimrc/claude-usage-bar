@@ -2,7 +2,7 @@
 
 macOS menu bar app that shows plan usage for several Claude Code, Codex, Kimi Code, Grok and sub2api accounts at once: 5-hour, weekly, per-model and billing-period limits with reset countdowns.
 
-<img src="docs/screenshot.png" width="380" alt="Panel with six accounts, names hidden">
+<img src="docs/screenshot.png" width="380" alt="Compact panel with nine accounts, names hidden">
 
 ## Install
 

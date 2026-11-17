@@ -301,11 +301,13 @@ struct AccountCard: View {
                         if !focused, editing { commitRename() }
                     }
             } else {
-                Text(account.displayName)
+                // Hidden names are replaced, not only blurred: a blur filter is skipped by
+                // offscreen captures (--snapshot) and can leave text guessable.
+                Text(hideName ? "••••••••••" : account.displayName)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                     .truncationMode(.tail)
-                    .blur(radius: hideName ? 6 : 0)
+                    .blur(radius: hideName ? 4 : 0)
                     .animation(.easeInOut(duration: 0.2), value: hideName)
                     .help(account.alias == nil || hideName ? "" : account.name)
             }
@@ -347,7 +349,7 @@ struct LimitRow: View {
         TimelineView(.periodic(from: .now, by: 60)) { ctx in
             HStack(spacing: 8) {
                 Text(limit.title).font(.caption).frame(width: 84, alignment: .leading)
-                ProgressView(value: min(limit.percent, 100), total: 100).tint(limit.tint)
+                UsageBar(percent: limit.percent, tint: limit.tint)
                 Text("\(Int(limit.percent.rounded()))%")
                     .font(.caption.monospacedDigit()).frame(width: 36, alignment: .trailing)
                 Text(limit.resetDate.flatMap { countdown(to: $0, now: ctx.date) } ?? "—")
@@ -362,13 +364,31 @@ struct MiniBar: View {
 
     var body: some View {
         HStack(spacing: 3) {
-            ProgressView(value: min(limit.percent, 100), total: 100).tint(limit.tint).frame(width: 40)
+            UsageBar(percent: limit.percent, tint: limit.tint).frame(width: 40)
             Text("\(Int(limit.percent.rounded()))%")
                 .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(width: 32, alignment: .trailing)
         }
         .help("\(limit.title) · \(limit.resetDate.flatMap { countdown(to: $0) }.map { "\($0)后重置" } ?? "无重置时间")")
+    }
+}
+
+/// Drawn in SwiftUI rather than NSProgressIndicator so it keeps its color in
+/// inactive and offscreen windows.
+struct UsageBar: View {
+    let percent: Double
+    let tint: Color
+
+    var body: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule().fill(tint)
+                    .frame(width: percent > 0 ? max(g.size.width * min(percent, 100) / 100, 5) : 0)
+            }
+        }
+        .frame(height: 5)
     }
 }
 
