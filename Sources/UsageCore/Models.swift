@@ -1,94 +1,147 @@
 import Foundation
 
-/// One Claude organization login. Keyed by organization UUID because every
-/// account may share the same email.
+public enum Provider: String, Codable, Sendable {
+    case claude, codex
+}
+
+/// One login. `id` is the Claude organization UUID or the ChatGPT account id,
+/// because several accounts may share one email.
 public struct Account: Codable, Identifiable, Sendable, Equatable {
+    public var provider: Provider
     public var id: String
     public var name: String
     public var accessToken: String
     public var refreshToken: String
     public var expiresAt: Date
 
-    public init(id: String, name: String, accessToken: String, refreshToken: String, expiresAt: Date) {
+    public init(provider: Provider, id: String, name: String, accessToken: String, refreshToken: String, expiresAt: Date) {
+        self.provider = provider
         self.id = id
         self.name = name
         self.accessToken = accessToken
         self.refreshToken = refreshToken
         self.expiresAt = expiresAt
     }
-}
 
-public struct TokenResponse: Decodable, Sendable {
-    public let accessToken: String
-    public let refreshToken: String?
-    public let expiresIn: Double
-}
+    enum CodingKeys: String, CodingKey { case provider, id, name, accessToken, refreshToken, expiresAt }
 
-public struct Profile: Decodable, Sendable {
-    public struct Organization: Decodable, Sendable {
-        public let uuid: String
-        public let name: String
+    // Accounts saved before Codex support have no provider; they are all Claude.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try c.decodeIfPresent(Provider.self, forKey: .provider) ?? .claude
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        accessToken = try c.decode(String.self, forKey: .accessToken)
+        refreshToken = try c.decode(String.self, forKey: .refreshToken)
+        expiresAt = try c.decode(Date.self, forKey: .expiresAt)
     }
-    public let organization: Organization
 }
 
-public struct Limit: Decodable, Sendable, Identifiable {
-    public struct Scope: Decodable, Sendable {
-        public struct Model: Decodable, Sendable { public let displayName: String? }
-        public let model: Model?
+extension Array where Element: Identifiable {
+    /// Drag-and-drop reorder: the moved element takes the target's slot, so it
+    /// lands after the target when moving down and before it when moving up.
+    public mutating func move(id: Element.ID, onto target: Element.ID) {
+        guard id != target, let from = firstIndex(where: { $0.id == id }),
+              let to = firstIndex(where: { $0.id == target }) else { return }
+        insert(remove(at: from), at: to)
     }
+}
 
-    public let kind: String
+public struct Limit: Sendable, Identifiable, Equatable {
+    public let title: String
     public let percent: Double
-    public let resetsAt: String?
-    public let scope: Scope?
+    public let resetDate: Date?
 
-    public init(kind: String, percent: Double, resetsAt: String?, scope: Scope? = nil) {
-        self.kind = kind
+    public init(title: String, percent: Double, resetDate: Date?) {
+        self.title = title
         self.percent = percent
-        self.resetsAt = resetsAt
-        self.scope = scope
+        self.resetDate = resetDate
     }
 
-    public var id: String { "\(kind)/\(scope?.model?.displayName ?? "")" }
-    public var resetDate: Date? { resetsAt.flatMap(parseISODate) }
+    public var id: String { title }
+}
 
-    public var title: String {
+public struct Usage: Sendable, Equatable {
+    public let limits: [Limit]
+}
+
+/// `/api/oauth/usage`. `limits` is the current shape; the flat windows are a fallback.
+struct ClaudeUsageWire: Decodable {
+    struct Entry: Decodable {
+        struct Scope: Decodable {
+            struct Model: Decodable { let displayName: String? }
+            let model: Model?
+        }
+        let kind: String
+        let percent: Double
+        let resetsAt: String?
+        let scope: Scope?
+    }
+
+    struct Window: Decodable {
+        let utilization: Double?
+        let resetsAt: String?
+    }
+
+    let limits: [Entry]?
+    let fiveHour: Window?
+    let sevenDay: Window?
+
+    var usage: Usage {
+        if let limits, !limits.isEmpty {
+            return Usage(limits: limits.map {
+                Limit(title: Self.title($0.kind, model: $0.scope?.model?.displayName),
+                      percent: $0.percent, resetDate: $0.resetsAt.flatMap(parseISODate))
+            })
+        }
+        let flat: [(String, Window?)] = [("session", fiveHour), ("weekly_all", sevenDay)]
+        return Usage(limits: flat.compactMap { kind, w in
+            guard let w, let u = w.utilization else { return nil }
+            return Limit(title: Self.title(kind, model: nil), percent: u, resetDate: w.resetsAt.flatMap(parseISODate))
+        })
+    }
+
+    static func title(_ kind: String, model: String?) -> String {
         switch kind {
         case "session": "5 小时"
         case "weekly_all": "本周"
-        case "weekly_scoped": "本周 · \(scope?.model?.displayName ?? "模型")"
+        case "weekly_scoped": "本周 · \(model ?? "模型")"
         default: kind
         }
     }
 }
 
-public struct Usage: Decodable, Sendable {
-    struct Window: Decodable, Sendable {
-        let utilization: Double?
-        let resetsAt: String?
+/// `chatgpt.com/backend-api/wham/usage`.
+struct CodexUsageWire: Decodable {
+    struct Window: Decodable {
+        let usedPercent: Double
+        let limitWindowSeconds: Int?
+        let resetAt: Double?
     }
 
-    public let limits: [Limit]
+    struct RateLimit: Decodable {
+        let primaryWindow: Window?
+        let secondaryWindow: Window?
+    }
 
-    enum CodingKeys: String, CodingKey { case limits, fiveHour, sevenDay }
+    let rateLimit: RateLimit?
 
-    public init(limits: [Limit]) { self.limits = limits }
+    var usage: Usage {
+        Usage(limits: [rateLimit?.primaryWindow, rateLimit?.secondaryWindow].compactMap { w in
+            guard let w else { return nil }
+            return Limit(title: windowTitle(seconds: w.limitWindowSeconds), percent: w.usedPercent,
+                         resetDate: w.resetAt.map(Date.init(timeIntervalSince1970:)))
+        })
+    }
+}
 
-    // `limits` is the current shape; fall back to the flat windows if it is absent.
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        if let limits = try c.decodeIfPresent([Limit].self, forKey: .limits), !limits.isEmpty {
-            self.limits = limits
-            return
-        }
-        var out: [Limit] = []
-        for (key, kind) in [(CodingKeys.fiveHour, "session"), (.sevenDay, "weekly_all")] {
-            if let w = try c.decodeIfPresent(Window.self, forKey: key), let u = w.utilization {
-                out.append(Limit(kind: kind, percent: u, resetsAt: w.resetsAt))
-            }
-        }
-        limits = out
+func windowTitle(seconds: Int?) -> String {
+    switch seconds {
+    case 18000: "5 小时"
+    case 604_800: "本周"
+    case let s? where s % 86400 == 0: "\(s / 86400) 天"
+    case let s?: "\(s / 3600) 小时"
+    case nil: "额度"
     }
 }
 

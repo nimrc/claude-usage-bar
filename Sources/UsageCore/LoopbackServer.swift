@@ -9,12 +9,16 @@ public final class LoopbackServer: @unchecked Sendable {
     private var ready: CheckedContinuation<UInt16, Error>?
     private var waiter: CheckedContinuation<[String: String], Error>?
     private var result: Result<[String: String], Error>?
+    private let path: String
 
-    public init() throws {
+    /// `port` nil picks a free one; Codex needs a fixed, pre-registered port.
+    public init(port: UInt16? = nil, path: String) throws {
         let params = NWParameters.tcp
         // Loopback only, both v4 and v6: browsers may resolve "localhost" to either.
         params.requiredInterfaceType = .loopback
-        listener = try NWListener(using: params)
+        params.allowLocalEndpointReuse = true
+        self.path = path
+        listener = try NWListener(using: params, on: port.flatMap(NWEndpoint.Port.init(rawValue:)) ?? .any)
     }
 
     /// Starts listening and returns the bound port.
@@ -50,7 +54,9 @@ public final class LoopbackServer: @unchecked Sendable {
         case .ready:
             ready?.resume(returning: listener.port?.rawValue ?? 0)
             ready = nil
-        case .failed(let e):
+        case .failed(let e), .waiting(let e):
+            // A taken port shows up as .waiting; treat it as a failed start.
+            listener.cancel()
             ready?.resume(throwing: e)
             ready = nil
             finish(.failure(e))
@@ -69,7 +75,7 @@ public final class LoopbackServer: @unchecked Sendable {
     private func accept(_ conn: NWConnection) {
         conn.start(queue: queue)
         conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, _, _ in
-            let query = data.flatMap(Self.callbackQuery)
+            let query = data.flatMap { Self.callbackQuery($0, path: self.path) }
             let body = query == nil
                 ? "Not found"
                 : "<!doctype html><meta charset=utf-8><body style=\"font:16px -apple-system;padding:40px\">已完成登录，可以关闭此页面。</body>"
@@ -80,11 +86,11 @@ public final class LoopbackServer: @unchecked Sendable {
         }
     }
 
-    /// Parses "GET /callback?code=..&state=.. HTTP/1.1".
-    static func callbackQuery(_ request: Data) -> [String: String]? {
+    /// Parses "GET <path>?code=..&state=.. HTTP/1.1".
+    static func callbackQuery(_ request: Data, path: String) -> [String: String]? {
         guard let line = String(decoding: request, as: UTF8.self).split(separator: "\r\n").first else { return nil }
         let parts = line.split(separator: " ")
-        guard parts.count >= 2, let c = URLComponents(string: String(parts[1])), c.path == "/callback" else { return nil }
+        guard parts.count >= 2, let c = URLComponents(string: String(parts[1])), c.path == path else { return nil }
         var out: [String: String] = [:]
         for item in c.queryItems ?? [] { out[item.name] = item.value ?? "" }
         return out

@@ -33,7 +33,8 @@ final class Store {
 
     var isLoggingIn: Bool { loginServer != nil }
 
-    private let api = ClaudeAPI()
+    private let claude = ClaudeAPI()
+    private let codex = CodexAPI()
 
     init() {
         Task { await pollLoop() }
@@ -67,13 +68,17 @@ final class Store {
         guard var a = accounts.first(where: { $0.id == id }) else { return }
         do {
             if a.expiresAt < .now.addingTimeInterval(120) {
-                let t = try await api.refresh(a.refreshToken)
+                let t = try await a.provider == .claude ? claude.refresh(a.refreshToken) : codex.refresh(a.refreshToken)
                 a.accessToken = t.accessToken
                 a.refreshToken = t.refreshToken ?? a.refreshToken
-                a.expiresAt = .now.addingTimeInterval(t.expiresIn)
+                a.expiresAt = t.expiresAt
                 upsert(a)
             }
-            status[id] = Status(usage: try await api.usage(accessToken: a.accessToken))
+            let usage = switch a.provider {
+            case .claude: try await claude.usage(accessToken: a.accessToken)
+            case .codex: try await codex.usage(accessToken: a.accessToken, accountID: a.id)
+            }
+            status[id] = Status(usage: usage)
         } catch let e as APIError {
             if e.status == 401 {
                 // Access token revoked early; force a refresh on the next poll.
@@ -86,42 +91,34 @@ final class Store {
         }
     }
 
-    /// Browser OAuth via a loopback redirect. The org picked in the browser decides which account this is.
-    func addAccount() async {
+    /// Browser OAuth via a loopback redirect. The org/workspace picked in the browser decides which account this is.
+    func addAccount(_ provider: Provider) async {
         guard loginServer == nil else { return }
         loginError = nil
         do {
-            let server = try LoopbackServer()
-            loginServer = server
-            defer {
-                server.stop()
-                loginServer = nil
-            }
-            let port = try await server.start()
-            let redirect = "http://localhost:\(port)/callback"
             let pkce = PKCE()
-            NSWorkspace.shared.open(pkce.authorizeURL(redirectURI: redirect))
-
-            let timeout = Task {
-                try await Task.sleep(for: .seconds(300))
-                server.stop()
+            let account: Account
+            switch provider {
+            case .claude:
+                let (code, redirect) = try await authorize(pkce: pkce, ports: [nil], path: ClaudeOAuth.callbackPath) {
+                    ClaudeOAuth.authorizeURL(pkce: pkce, redirectURI: "http://localhost:\($0)\(ClaudeOAuth.callbackPath)")
+                }
+                let t = try await claude.exchange(code: code, pkce: pkce, redirectURI: redirect)
+                guard let refreshToken = t.refreshToken else { throw LoginError("登录未返回 refresh token") }
+                let org = try await claude.profile(accessToken: t.accessToken).organization
+                account = Account(provider: .claude, id: org.uuid, name: org.name, accessToken: t.accessToken,
+                                  refreshToken: refreshToken, expiresAt: t.expiresAt)
+            case .codex:
+                let (code, redirect) = try await authorize(pkce: pkce, ports: CodexOAuth.ports, path: CodexOAuth.callbackPath) {
+                    CodexOAuth.authorizeURL(pkce: pkce, redirectURI: CodexOAuth.redirectURI(port: $0))
+                }
+                let t = try await codex.exchange(code: code, pkce: pkce, redirectURI: redirect)
+                guard let refreshToken = t.refreshToken, let identity = t.idToken.flatMap(CodexIdentity.init(idToken:)) else {
+                    throw LoginError("登录未返回完整的 token")
+                }
+                account = Account(provider: .codex, id: identity.accountID, name: identity.label, accessToken: t.accessToken,
+                                  refreshToken: refreshToken, expiresAt: t.expiresAt)
             }
-            defer { timeout.cancel() }
-            let query = try await server.callback()
-
-            if let err = query["error"] {
-                throw LoginError("登录失败：\(query["error_description"] ?? err)")
-            }
-            guard query["state"] == pkce.state, let raw = query["code"] else {
-                throw LoginError("登录回调参数不匹配")
-            }
-            let code = String(raw.split(separator: "#").first ?? "")
-            let t = try await api.exchange(code: code, pkce: pkce, redirectURI: redirect)
-            guard let refreshToken = t.refreshToken else { throw LoginError("登录未返回 refresh token") }
-            let org = try await api.profile(accessToken: t.accessToken).organization
-            let account = Account(
-                id: org.uuid, name: org.name, accessToken: t.accessToken,
-                refreshToken: refreshToken, expiresAt: .now.addingTimeInterval(t.expiresIn))
             upsert(account)
             await refresh(account.id)
         } catch is CancellationError {
@@ -130,7 +127,54 @@ final class Store {
         }
     }
 
+    /// Binds the first free port, opens the browser, and returns (code, redirect URI).
+    private func authorize(pkce: PKCE, ports: [UInt16?], path: String, url: (UInt16) -> URL) async throws -> (String, String) {
+        var bound: (LoopbackServer, UInt16)?
+        var lastError: Error?
+        for p in ports {
+            do {
+                let s = try LoopbackServer(port: p, path: path)
+                bound = (s, try await s.start())
+                break
+            } catch {
+                lastError = error
+            }
+        }
+        guard let (server, port) = bound else {
+            throw LoginError("回调端口被占用：\(lastError?.localizedDescription ?? "")")
+        }
+        loginServer = server
+        defer {
+            server.stop()
+            loginServer = nil
+        }
+        let authURL = url(port)
+        NSWorkspace.shared.open(authURL)
+
+        let timeout = Task {
+            try await Task.sleep(for: .seconds(300))
+            server.stop()
+        }
+        defer { timeout.cancel() }
+        let query = try await server.callback()
+
+        if let err = query["error"] {
+            throw LoginError("登录失败：\(query["error_description"] ?? err)")
+        }
+        guard query["state"] == pkce.state, let raw = query["code"] else {
+            throw LoginError("登录回调参数不匹配")
+        }
+        let redirect = URLComponents(url: authURL, resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name == "redirect_uri" }?.value ?? ""
+        return (String(raw.split(separator: "#").first ?? ""), redirect)
+    }
+
     func cancelLogin() { loginServer?.stop() }
+
+    func move(_ id: String, onto target: String) {
+        accounts.move(id: id, onto: target)
+        persist()
+    }
 
     func remove(_ id: String) {
         accounts.removeAll { $0.id == id }

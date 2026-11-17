@@ -21,13 +21,17 @@ func printStatus() async {
     let accounts = Vault.load()
     if accounts.isEmpty { print("没有账号") }
     for a in accounts {
-        print(a.name)
+        print("[\(a.provider.rawValue)] \(a.name)")
         guard a.expiresAt > .now else {
             print("  access token 已过期，等菜单栏 App 刷新")
             continue
         }
         do {
-            for l in try await ClaudeAPI().usage(accessToken: a.accessToken).limits {
+            let usage = switch a.provider {
+            case .claude: try await ClaudeAPI().usage(accessToken: a.accessToken)
+            case .codex: try await CodexAPI().usage(accessToken: a.accessToken, accountID: a.id)
+            }
+            for l in usage.limits {
                 let reset = l.resetDate.flatMap { countdown(to: $0) } ?? "—"
                 print("  \(l.title)\t\(Int(l.percent.rounded()))%\t\(reset)")
             }
@@ -52,12 +56,20 @@ struct ClaudeUsageBarApp: App {
 
 struct UsagePanel: View {
     @Bindable var store: Store
+    @AppStorage("hideNames") private var hideNames = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("Claude 用量").font(.headline)
+                Text("AI 用量").font(.headline)
                 Spacer()
+                Toggle(isOn: $hideNames) {
+                    Image(systemName: hideNames ? "eye.slash" : "eye")
+                        .foregroundStyle(.secondary)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .help("隐藏账号名称")
                 if let t = store.lastUpdated {
                     Text(t, format: .dateTime.hour().minute()).font(.caption).foregroundStyle(.secondary)
                 }
@@ -71,11 +83,11 @@ struct UsagePanel: View {
             }
 
             if store.accounts.isEmpty {
-                Text("还没有账号。点「添加账号」，在浏览器里登录并选择组织。")
+                Text("还没有账号。点「添加账号」选择 Claude 或 Codex，在浏览器里登录并选择组织。")
                     .font(.callout).foregroundStyle(.secondary)
             }
             ForEach(store.accounts) { account in
-                AccountCard(account: account, status: store.status[account.id], store: store)
+                AccountCard(account: account, status: store.status[account.id], store: store, hideName: hideNames)
             }
 
             if let e = store.loginError {
@@ -89,7 +101,11 @@ struct UsagePanel: View {
                     Text("等待浏览器登录…").font(.callout)
                     Button("取消") { store.cancelLogin() }
                 } else {
-                    Button("添加账号") { Task { await store.addAccount() } }
+                    Menu("添加账号") {
+                        Button("Claude") { Task { await store.addAccount(.claude) } }
+                        Button("Codex") { Task { await store.addAccount(.codex) } }
+                    }
+                    .fixedSize()
                 }
                 Spacer()
                 Toggle("开机启动", isOn: $store.launchAtLogin).toggleStyle(.checkbox)
@@ -107,14 +123,16 @@ struct AccountCard: View {
     let account: Account
     let status: Store.Status?
     let store: Store
+    let hideName: Bool
+    @State private var dropTargeted = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(account.name).font(.subheadline.weight(.semibold))
+            HStack(spacing: 6) {
+                title
                 Spacer()
                 Menu {
-                    Button("重新登录") { Task { await store.addAccount() } }
+                    Button("重新登录") { Task { await store.addAccount(account.provider) } }
                     Button("移除", role: .destructive) { store.remove(account.id) }
                 } label: {
                     Image(systemName: "ellipsis")
@@ -134,6 +152,30 @@ struct AccountCard: View {
         }
         .padding(10)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.accentColor, lineWidth: 2)
+                .opacity(dropTargeted ? 1 : 0)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .draggable(account.id) {
+            title.padding(8).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+        }
+        .dropDestination(for: String.self) { ids, _ in
+            guard let id = ids.first else { return false }
+            withAnimation(.easeInOut(duration: 0.2)) { store.move(id, onto: account.id) }
+            return true
+        } isTargeted: { dropTargeted = $0 }
+    }
+
+    private var title: some View {
+        HStack(spacing: 6) {
+            ProviderLogo(provider: account.provider)
+            Text(account.name)
+                .font(.subheadline.weight(.semibold))
+                .blur(radius: hideName ? 6 : 0)
+                .animation(.easeInOut(duration: 0.2), value: hideName)
+        }
     }
 }
 
@@ -155,5 +197,34 @@ struct LimitRow: View {
 
     private var color: Color {
         limit.percent >= 90 ? .red : limit.percent >= 70 ? .orange : .green
+    }
+}
+
+struct ProviderLogo: View {
+    let provider: Provider
+
+    // Template SVGs from simple-icons, bundled into Contents/Resources by scripts/bundle.sh.
+    private static let images: [Provider: NSImage] = {
+        var out: [Provider: NSImage] = [:]
+        for (p, file) in [(Provider.claude, "claude"), (.codex, "openai")] {
+            if let url = Bundle.main.url(forResource: file, withExtension: "svg"), let img = NSImage(contentsOf: url) {
+                img.isTemplate = true
+                out[p] = img
+            }
+        }
+        return out
+    }()
+
+    var body: some View {
+        Group {
+            if let img = Self.images[provider] {
+                Image(nsImage: img).resizable()
+            } else {
+                Image(systemName: provider == .claude ? "sparkle" : "circle.hexagongrid")
+            }
+        }
+        .frame(width: 14, height: 14)
+        .foregroundStyle(provider == .claude ? Color(red: 0.85, green: 0.47, blue: 0.34) : .primary)
+        .help(provider == .claude ? "Claude" : "Codex")
     }
 }
