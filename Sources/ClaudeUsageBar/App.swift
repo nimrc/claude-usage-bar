@@ -30,11 +30,20 @@ func printStatus() async {
             let usage = switch a.provider {
             case .claude: try await ClaudeAPI().usage(accessToken: a.accessToken)
             case .codex: try await CodexAPI().usage(accessToken: a.accessToken, accountID: a.id)
+            case .kimi: try await KimiAPI().usage(apiKey: a.accessToken)
+            case .sub2api: try await Sub2API().usage(baseURL: a.baseURL ?? "", apiKey: a.accessToken).usage
+            case .grok:
+                if let c = GrokCredential.load() {
+                    try await GrokAPI().usage(accessToken: c.accessToken)
+                } else {
+                    throw LoginError("未找到 grok 登录")
+                }
             }
             for l in usage.limits {
                 let reset = l.resetDate.flatMap { countdown(to: $0) } ?? "—"
                 print("  \(l.title)\t\(Int(l.percent.rounded()))%\t\(reset)")
             }
+            if let note = usage.note { print("  \(note)") }
         } catch {
             print("  错误：\(error.localizedDescription)")
         }
@@ -57,6 +66,7 @@ struct ClaudeUsageBarApp: App {
 struct UsagePanel: View {
     @Bindable var store: Store
     @AppStorage("hideNames") private var hideNames = false
+    @State private var keyForm: Provider?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -83,11 +93,15 @@ struct UsagePanel: View {
             }
 
             if store.accounts.isEmpty {
-                Text("还没有账号。点「添加账号」选择 Claude 或 Codex，在浏览器里登录并选择组织。")
+                Text("还没有账号。点「添加账号」选择服务商。")
                     .font(.callout).foregroundStyle(.secondary)
             }
             ForEach(store.accounts) { account in
                 AccountCard(account: account, status: store.status[account.id], store: store, hideName: hideNames)
+            }
+
+            if let provider = keyForm {
+                KeyForm(provider: provider, store: store) { keyForm = nil }
             }
 
             if let e = store.loginError {
@@ -104,6 +118,9 @@ struct UsagePanel: View {
                     Menu("添加账号") {
                         Button("Claude") { Task { await store.addAccount(.claude) } }
                         Button("Codex") { Task { await store.addAccount(.codex) } }
+                        Button("Kimi Code…") { keyForm = .kimi }
+                        Button("Grok（读取 grok CLI 登录）") { Task { await store.addAccount(.grok) } }
+                        Button("sub2api…") { keyForm = .sub2api }
                     }
                     .fixedSize()
                 }
@@ -132,7 +149,9 @@ struct AccountCard: View {
                 title
                 Spacer()
                 Menu {
-                    Button("重新登录") { Task { await store.addAccount(account.provider) } }
+                    if account.provider == .claude || account.provider == .codex {
+                        Button("重新登录") { Task { await store.addAccount(account.provider) } }
+                    }
                     Button("移除", role: .destructive) { store.remove(account.id) }
                 } label: {
                     Image(systemName: "ellipsis")
@@ -143,6 +162,9 @@ struct AccountCard: View {
             }
             if let usage = status?.usage {
                 ForEach(usage.limits) { LimitRow(limit: $0) }
+                if let note = usage.note {
+                    Text(note).font(.caption).foregroundStyle(.secondary)
+                }
             } else if status == nil {
                 ProgressView().controlSize(.small)
             }
@@ -203,10 +225,10 @@ struct LimitRow: View {
 struct ProviderLogo: View {
     let provider: Provider
 
-    // Template SVGs from simple-icons, bundled into Contents/Resources by scripts/bundle.sh.
+    // Template SVGs (simple-icons, lobe-icons), bundled into Contents/Resources by scripts/bundle.sh.
     private static let images: [Provider: NSImage] = {
         var out: [Provider: NSImage] = [:]
-        for (p, file) in [(Provider.claude, "claude"), (.codex, "openai")] {
+        for (p, file) in [(Provider.claude, "claude"), (.codex, "openai"), (.kimi, "kimi"), (.grok, "grok")] {
             if let url = Bundle.main.url(forResource: file, withExtension: "svg"), let img = NSImage(contentsOf: url) {
                 img.isTemplate = true
                 out[p] = img
@@ -220,11 +242,53 @@ struct ProviderLogo: View {
             if let img = Self.images[provider] {
                 Image(nsImage: img).resizable()
             } else {
-                Image(systemName: provider == .claude ? "sparkle" : "circle.hexagongrid")
+                Image(systemName: provider == .sub2api ? "server.rack" : "circle.hexagongrid").resizable().scaledToFit()
             }
         }
         .frame(width: 14, height: 14)
         .foregroundStyle(provider == .claude ? Color(red: 0.85, green: 0.47, blue: 0.34) : .primary)
-        .help(provider == .claude ? "Claude" : "Codex")
+        .help(provider.displayName)
+    }
+}
+
+/// Inline form for API-key providers; the key is checked against the usage endpoint before saving.
+struct KeyForm: View {
+    let provider: Provider
+    let store: Store
+    let done: () -> Void
+    @State private var key = ""
+    @State private var baseURL = ""
+    @State private var saving = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                ProviderLogo(provider: provider)
+                Text("添加 \(provider.displayName)").font(.subheadline.weight(.semibold))
+            }
+            if provider == .sub2api {
+                TextField("部署地址，例如 https://sub2api.example.com", text: $baseURL)
+                    .textFieldStyle(.roundedBorder)
+            }
+            SecureField(provider == .kimi ? "Kimi Code API key（sk-kimi-…）" : "分组 API key（sk-…）", text: $key)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                if saving { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("取消", action: done)
+                Button("保存") {
+                    saving = true
+                    Task {
+                        if await store.addKeyAccount(provider, key: key, baseURL: baseURL) { done() }
+                        saving = false
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(saving || key.isEmpty || (provider == .sub2api && baseURL.isEmpty))
+            }
+        }
+        .controlSize(.small)
+        .padding(10)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
     }
 }

@@ -1,11 +1,22 @@
 import Foundation
 
-public enum Provider: String, Codable, Sendable {
-    case claude, codex
+public enum Provider: String, Codable, Sendable, CaseIterable {
+    case claude, codex, kimi, grok, sub2api
+
+    public var displayName: String {
+        switch self {
+        case .claude: "Claude"
+        case .codex: "Codex"
+        case .kimi: "Kimi Code"
+        case .grok: "Grok"
+        case .sub2api: "sub2api"
+        }
+    }
 }
 
-/// One login. `id` is the Claude organization UUID or the ChatGPT account id,
-/// because several accounts may share one email.
+/// One account. `id` is the Claude organization UUID, the ChatGPT account id,
+/// the Grok user id, or a hash of an API key, because several accounts may share one email.
+/// API-key providers keep the key in `accessToken`; Grok keeps nothing and reads the grok CLI login.
 public struct Account: Codable, Identifiable, Sendable, Equatable {
     public var provider: Provider
     public var id: String
@@ -13,17 +24,21 @@ public struct Account: Codable, Identifiable, Sendable, Equatable {
     public var accessToken: String
     public var refreshToken: String
     public var expiresAt: Date
+    /// sub2api deployment.
+    public var baseURL: String?
 
-    public init(provider: Provider, id: String, name: String, accessToken: String, refreshToken: String, expiresAt: Date) {
+    public init(provider: Provider, id: String, name: String, accessToken: String, refreshToken: String,
+                expiresAt: Date, baseURL: String? = nil) {
         self.provider = provider
         self.id = id
         self.name = name
         self.accessToken = accessToken
         self.refreshToken = refreshToken
         self.expiresAt = expiresAt
+        self.baseURL = baseURL
     }
 
-    enum CodingKeys: String, CodingKey { case provider, id, name, accessToken, refreshToken, expiresAt }
+    enum CodingKeys: String, CodingKey { case provider, id, name, accessToken, refreshToken, expiresAt, baseURL }
 
     // Accounts saved before Codex support have no provider; they are all Claude.
     public init(from decoder: Decoder) throws {
@@ -34,6 +49,7 @@ public struct Account: Codable, Identifiable, Sendable, Equatable {
         accessToken = try c.decode(String.self, forKey: .accessToken)
         refreshToken = try c.decode(String.self, forKey: .refreshToken)
         expiresAt = try c.decode(Date.self, forKey: .expiresAt)
+        baseURL = try c.decodeIfPresent(String.self, forKey: .baseURL)
     }
 }
 
@@ -63,6 +79,13 @@ public struct Limit: Sendable, Identifiable, Equatable {
 
 public struct Usage: Sendable, Equatable {
     public let limits: [Limit]
+    /// Non-percentage facts such as a wallet balance.
+    public var note: String?
+
+    public init(limits: [Limit], note: String? = nil) {
+        self.limits = limits
+        self.note = note
+    }
 }
 
 /// `/api/oauth/usage`. `limits` is the current shape; the flat windows are a fallback.
@@ -133,6 +156,158 @@ struct CodexUsageWire: Decodable {
                          resetDate: w.resetAt.map(Date.init(timeIntervalSince1970:)))
         })
     }
+}
+
+/// `api.kimi.com/coding/v1/usages`. Counts are strings; `usage` is the weekly
+/// quota and `limits` holds the short windows (5 hours today).
+struct KimiUsageWire: Decodable {
+    struct Detail: Decodable {
+        let limit: String?
+        let used: String?
+        let resetTime: String?
+    }
+    struct Window: Decodable {
+        let duration: Int?
+        let timeUnit: String?
+    }
+    struct Entry: Decodable {
+        let window: Window?
+        let detail: Detail?
+    }
+
+    let usage: Detail?
+    let limits: [Entry]?
+
+    var parsed: Usage {
+        var out: [Limit] = []
+        for e in limits ?? [] {
+            if let l = e.detail.flatMap({ Self.limit($0, title: windowTitle(seconds: Self.seconds(e.window))) }) { out.append(l) }
+        }
+        if let l = usage.flatMap({ Self.limit($0, title: "本周") }) { out.append(l) }
+        return Usage(limits: out)
+    }
+
+    static func limit(_ d: Detail, title: String) -> Limit? {
+        guard let limit = d.limit.flatMap(Double.init), limit > 0, let used = d.used.flatMap(Double.init) else { return nil }
+        return Limit(title: title, percent: used / limit * 100, resetDate: d.resetTime.flatMap(parseISODate))
+    }
+
+    static func seconds(_ w: Window?) -> Int? {
+        guard let w, let n = w.duration else { return nil }
+        let unit = switch w.timeUnit {
+        case "TIME_UNIT_SECOND": 1
+        case "TIME_UNIT_MINUTE": 60
+        case "TIME_UNIT_HOUR": 3600
+        case "TIME_UNIT_DAY": 86400
+        default: 0
+        }
+        return unit == 0 ? nil : n * unit
+    }
+}
+
+/// sub2api `GET /v1/usage`, amounts in USD. Three shapes: a quota-limited key
+/// (total quota and rolling rate-limit windows), a subscription group
+/// (daily/weekly/monthly spend limits), or a wallet (balance only).
+struct Sub2APIUsageWire: Decodable {
+    struct Quota: Decodable {
+        let limit: Double
+        let used: Double
+    }
+    struct RateLimit: Decodable {
+        let window: String
+        let limit: Double
+        let used: Double
+        let resetAt: String?
+    }
+    struct Subscription: Decodable {
+        let dailyUsageUsd: Double?
+        let weeklyUsageUsd: Double?
+        let monthlyUsageUsd: Double?
+        let dailyLimitUsd: Double?
+        let weeklyLimitUsd: Double?
+        let monthlyLimitUsd: Double?
+        let weeklyWindowStart: String?
+        let expiresAt: String?
+    }
+
+    let planName: String?
+    let quota: Quota?
+    let rateLimits: [RateLimit]?
+    let subscription: Subscription?
+    let balance: Double?
+    let remaining: Double?
+
+    var parsed: Usage {
+        var out: [Limit] = []
+        for r in rateLimits ?? [] where r.limit > 0 {
+            let title = switch r.window {
+            case "5h": "5 小时"
+            case "1d": "1 天"
+            case "7d": "7 天"
+            default: r.window
+            }
+            out.append(Limit(title: title, percent: r.used / r.limit * 100, resetDate: r.resetAt.flatMap(parseISODate)))
+        }
+        if let q = quota, q.limit > 0 {
+            out.append(Limit(title: "总额度", percent: q.used / q.limit * 100, resetDate: nil))
+        }
+        if let s = subscription {
+            let weeklyReset = s.weeklyWindowStart.flatMap(parseISODate).map { $0.addingTimeInterval(7 * 86400) }
+            for (title, used, limit, reset) in [("今日", s.dailyUsageUsd, s.dailyLimitUsd, nil),
+                                                ("本周", s.weeklyUsageUsd, s.weeklyLimitUsd, weeklyReset),
+                                                ("本月", s.monthlyUsageUsd, s.monthlyLimitUsd, nil)] {
+                if let limit, limit > 0 {
+                    out.append(Limit(title: title, percent: (used ?? 0) / limit * 100, resetDate: reset))
+                }
+            }
+        }
+        var note: String?
+        if let balance {
+            note = String(format: "余额 $%.2f", balance)
+        } else if out.isEmpty, let remaining, remaining >= 0 {
+            note = String(format: "剩余 $%.2f", remaining)
+        }
+        return Usage(limits: out, note: note)
+    }
+}
+
+/// `cli-chat-proxy.grok.com/v1/billing?format=credits`. Parsed loosely because
+/// the key casing is not documented: camelCase and snake_case are both accepted.
+func parseGrokBilling(_ data: Data) -> Usage? {
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    let cfg = root["config"] as? [String: Any] ?? root
+    func value(_ d: [String: Any]?, _ camel: String) -> Any? {
+        let snake = camel.replacingOccurrences(of: "([a-z])([A-Z])", with: "$1_$2", options: .regularExpression).lowercased()
+        return d?[camel] ?? d?[snake]
+    }
+    func number(_ v: Any?) -> Double? {
+        if let n = v as? NSNumber { return n.doubleValue }
+        if let s = v as? String { return Double(s) }
+        if let d = v as? [String: Any] { return number(d["val"]) }
+        return nil
+    }
+    func date(_ v: Any?) -> Date? {
+        if let s = v as? String { return parseISODate(s) ?? Double(s).flatMap { date($0) } }
+        if let n = number(v) { return Date(timeIntervalSince1970: n > 1e12 ? n / 1000 : n) }
+        return nil
+    }
+
+    var percent = number(value(cfg, "creditUsagePercent"))
+    if percent == nil, let used = number(value(cfg, "onDemandUsed")), let cap = number(value(cfg, "onDemandCap")), cap > 0 {
+        percent = used / cap * 100
+    }
+    let period = value(cfg, "currentPeriod") as? [String: Any]
+    let reset = date(value(period, "end")) ?? date(value(cfg, "billingPeriodEnd"))
+
+    var out: [Limit] = []
+    if let percent { out.append(Limit(title: "本期额度", percent: percent, resetDate: reset)) }
+    for item in value(cfg, "productUsage") as? [[String: Any]] ?? [] {
+        if let name = item["product"] as? String, let p = number(value(item, "usagePercent")) {
+            out.append(Limit(title: name, percent: p, resetDate: reset))
+        }
+    }
+    let tier = (value(cfg, "subscriptionTier") ?? value(root, "subscriptionTier")) as? String
+    return out.isEmpty && tier == nil ? nil : Usage(limits: out, note: out.isEmpty ? tier : nil)
 }
 
 func windowTitle(seconds: Int?) -> String {

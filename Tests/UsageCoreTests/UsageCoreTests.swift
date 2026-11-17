@@ -137,3 +137,79 @@ private struct Item: Identifiable, Equatable { let id: String }
     a.move(id: "b", onto: "b")
     #expect(a.map(\.id) == ["d", "b", "c", "a"])
 }
+
+@Test func decodesKimiWindows() throws {
+    let u = try decode(KimiUsageWire.self, """
+    {"usage":{"limit":"100","used":"33","remaining":"67","resetTime":"2026-11-23T02:52:34.766609Z"},
+     "limits":[{"window":{"duration":300,"timeUnit":"TIME_UNIT_MINUTE"},
+                "detail":{"limit":"100","used":"4","remaining":"96","resetTime":"2026-11-17T09:52:34.766609Z"}}],
+     "booster_wallet":{"status":"STATUS_DISABLED"}}
+    """).parsed
+    #expect(u.limits == [
+        Limit(title: "5 小时", percent: 4, resetDate: parseISODate("2026-11-17T09:52:34Z")),
+        Limit(title: "本周", percent: 33, resetDate: parseISODate("2026-11-23T02:52:34Z")),
+    ])
+}
+
+@Test func decodesSub2APIQuotaKey() throws {
+    let u = try decode(Sub2APIUsageWire.self, """
+    {"mode":"quota_limited","isValid":true,"status":"active",
+     "quota":{"limit":10,"used":2.5,"remaining":7.5,"unit":"USD"},"remaining":7.5,"unit":"USD",
+     "rate_limits":[{"window":"5h","limit":2,"used":0.5,"remaining":1.5,
+                     "window_start":"2026-11-17T10:00:00.123Z","reset_at":"2026-11-17T15:00:00.123Z"},
+                    {"window":"7d","limit":20,"used":5,"remaining":15,"window_start":null}],
+     "usage":{"today":{"requests":1}}}
+    """).parsed
+    #expect(u.limits == [
+        Limit(title: "5 小时", percent: 25, resetDate: parseISODate("2026-11-17T15:00:00Z")),
+        Limit(title: "7 天", percent: 25, resetDate: nil),
+        Limit(title: "总额度", percent: 25, resetDate: nil),
+    ])
+    #expect(u.note == nil)
+}
+
+@Test func decodesSub2APISubscriptionAndWallet() throws {
+    let sub = try decode(Sub2APIUsageWire.self, """
+    {"mode":"unrestricted","isValid":true,"planName":"Pro","unit":"USD","remaining":12.34,
+     "subscription":{"daily_usage_usd":5,"weekly_usage_usd":10,"monthly_usage_usd":0,
+                     "daily_limit_usd":10,"weekly_limit_usd":null,"monthly_limit_usd":100,
+                     "weekly_window_start":"2026-11-10T00:00:00Z","expires_at":"2027-01-01T00:00:00Z"}}
+    """)
+    #expect(sub.planName == "Pro")
+    #expect(sub.parsed.limits.map(\.title) == ["今日", "本月"])
+    #expect(sub.parsed.limits.map(\.percent) == [50, 0])
+
+    let wallet = try decode(Sub2APIUsageWire.self,
+        #"{"mode":"unrestricted","isValid":true,"planName":"钱包余额","remaining":5,"unit":"USD","balance":5}"#).parsed
+    #expect(wallet.limits.isEmpty)
+    #expect(wallet.note == "余额 $5.00")
+}
+
+@Test func parsesGrokBillingInEitherCasing() throws {
+    let camel = Data(#"{"config":{"creditUsagePercent":42.5,"currentPeriod":{"start":"2026-11-01T00:00:00Z","end":"2026-12-01T00:00:00Z"},"subscriptionTier":"SuperGrok"}}"#.utf8)
+    #expect(parseGrokBilling(camel)?.limits == [Limit(title: "本期额度", percent: 42.5, resetDate: parseISODate("2026-12-01T00:00:00Z"))])
+    let snake = Data(#"{"config":{"on_demand_used":{"val":25},"on_demand_cap":{"val":100},"billing_period_end":1795000000}}"#.utf8)
+    #expect(parseGrokBilling(snake)?.limits == [Limit(title: "本期额度", percent: 25, resetDate: Date(timeIntervalSince1970: 1_795_000_000))])
+    #expect(parseGrokBilling(Data(#"{"config":{}}"#.utf8)) == nil)
+}
+
+@Test func readsGrokCLICredential() throws {
+    let json = #"{"https://accounts.x.ai/sign-in":{"key":"old"},"https://auth.x.ai::client":{"key":"tok","email":"a@b.c","user_id":"u1","expires_at":"2026-11-20T00:00:00Z"}}"#
+    let c = try #require(GrokCredential.parse(Data(json.utf8)))
+    #expect(c == GrokCredential(accessToken: "tok", userID: "u1", email: "a@b.c", expiresAt: parseISODate("2026-11-20T00:00:00Z")))
+    #expect(GrokCredential.parse(Data("{}".utf8)) == nil)
+}
+
+@Test func sub2APIBaseURLMustBeSafe() {
+    #expect(Sub2API.normalize(baseURL: " https://relay.example.com/ ") == "https://relay.example.com")
+    #expect(Sub2API.normalize(baseURL: "http://127.0.0.1:8080") == "http://127.0.0.1:8080")
+    #expect(Sub2API.normalize(baseURL: "http://relay.example.com") == nil)
+    #expect(Sub2API.normalize(baseURL: "https://u:p@relay.example.com") == nil)
+    #expect(Sub2API.normalize(baseURL: "https://relay.example.com?x=1") == nil)
+}
+
+@Test func keyAccountIDIsStableAndHidesKey() {
+    let id = keyAccountID(.kimi, "sk-kimi-secret")
+    #expect(id == keyAccountID(.kimi, "sk-kimi-secret"))
+    #expect(id.hasPrefix("kimi:") && !id.contains("secret") && id.count == 21)
+}
