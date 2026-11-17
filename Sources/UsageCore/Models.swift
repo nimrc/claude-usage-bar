@@ -26,6 +26,10 @@ public struct Account: Codable, Identifiable, Sendable, Equatable {
     public var expiresAt: Date
     /// sub2api deployment.
     public var baseURL: String?
+    /// User-chosen short name shown instead of `name`.
+    public var alias: String?
+
+    public var displayName: String { alias ?? name }
 
     public init(provider: Provider, id: String, name: String, accessToken: String, refreshToken: String,
                 expiresAt: Date, baseURL: String? = nil) {
@@ -38,7 +42,7 @@ public struct Account: Codable, Identifiable, Sendable, Equatable {
         self.baseURL = baseURL
     }
 
-    enum CodingKeys: String, CodingKey { case provider, id, name, accessToken, refreshToken, expiresAt, baseURL }
+    enum CodingKeys: String, CodingKey { case provider, id, name, accessToken, refreshToken, expiresAt, baseURL, alias }
 
     // Accounts saved before Codex support have no provider; they are all Claude.
     public init(from decoder: Decoder) throws {
@@ -50,6 +54,7 @@ public struct Account: Codable, Identifiable, Sendable, Equatable {
         refreshToken = try c.decode(String.self, forKey: .refreshToken)
         expiresAt = try c.decode(Date.self, forKey: .expiresAt)
         baseURL = try c.decodeIfPresent(String.self, forKey: .baseURL)
+        alias = try c.decodeIfPresent(String.self, forKey: .alias)
     }
 }
 
