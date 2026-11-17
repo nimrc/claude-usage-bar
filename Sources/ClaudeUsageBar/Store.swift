@@ -229,6 +229,13 @@ final class Store {
         }
     }
 
+    func rename(_ id: String, to alias: String) {
+        guard let i = accounts.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
+        accounts[i].alias = trimmed.isEmpty || trimmed == accounts[i].name ? nil : trimmed
+        persist()
+    }
+
     func move(_ id: String, onto target: String) {
         accounts.move(id: id, onto: target)
         persist()
@@ -240,8 +247,16 @@ final class Store {
         persist()
     }
 
+    /// The alias is owned by `rename`: a re-login or a token refresh started before
+    /// a rename must not overwrite it.
     private func upsert(_ a: Account) {
-        if let i = accounts.firstIndex(where: { $0.id == a.id }) { accounts[i] = a } else { accounts.append(a) }
+        if let i = accounts.firstIndex(where: { $0.id == a.id }) {
+            var a = a
+            a.alias = accounts[i].alias
+            accounts[i] = a
+        } else {
+            accounts.append(a)
+        }
         persist()
     }
 

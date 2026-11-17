@@ -213,3 +213,11 @@ private struct Item: Identifiable, Equatable { let id: String }
     #expect(id == keyAccountID(.kimi, "sk-kimi-secret"))
     #expect(id.hasPrefix("kimi:") && !id.contains("secret") && id.count == 21)
 }
+
+@Test func aliasOverridesNameAndIsOptional() throws {
+    let json = #"[{"provider":"kimi","id":"k","name":"Kimi Code ··abcd","accessToken":"a","refreshToken":"","expiresAt":"2026-11-17T11:59:59Z","alias":"K1"},{"id":"o","name":"Org","accessToken":"a","refreshToken":"r","expiresAt":"2026-11-17T11:59:59Z"}]"#
+    let accounts = try Vault.decoder.decode([Account].self, from: Data(json.utf8))
+    #expect(accounts.map(\.displayName) == ["K1", "Org"])
+    let roundTrip = try Vault.decoder.decode([Account].self, from: Vault.encoder.encode(accounts))
+    #expect(roundTrip == accounts)
+}

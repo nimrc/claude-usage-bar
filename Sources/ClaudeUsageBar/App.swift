@@ -21,7 +21,7 @@ func printStatus() async {
     let accounts = Vault.load()
     if accounts.isEmpty { print("没有账号") }
     for a in accounts {
-        print("[\(a.provider.rawValue)] \(a.name)")
+        print("[\(a.provider.rawValue)] \(a.displayName)")
         guard a.expiresAt > .now else {
             print("  access token 已过期，等菜单栏 App 刷新")
             continue
@@ -66,13 +66,21 @@ struct ClaudeUsageBarApp: App {
 struct UsagePanel: View {
     @Bindable var store: Store
     @AppStorage("hideNames") private var hideNames = false
+    @AppStorage("compact") private var compact = false
     @State private var keyForm: Provider?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: compact ? 6 : 10) {
             HStack {
                 Text("AI 用量").font(.headline)
                 Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { compact.toggle() }
+                } label: {
+                    Image(systemName: compact ? "rectangle.expand.vertical" : "rectangle.compress.vertical")
+                }
+                .buttonStyle(.borderless)
+                .help(compact ? "展开显示" : "紧凑显示")
                 Toggle(isOn: $hideNames) {
                     Image(systemName: hideNames ? "eye.slash" : "eye")
                         .foregroundStyle(.secondary)
@@ -97,7 +105,7 @@ struct UsagePanel: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             ForEach(store.accounts) { account in
-                AccountCard(account: account, status: store.status[account.id], store: store, hideName: hideNames)
+                AccountCard(account: account, status: store.status[account.id], store: store, hideName: hideNames, compact: compact)
             }
 
             if let provider = keyForm {
@@ -141,38 +149,31 @@ struct AccountCard: View {
     let status: Store.Status?
     let store: Store
     let hideName: Bool
+    let compact: Bool
     @State private var dropTargeted = false
+    @State private var expanded = false
+    @State private var editing = false
+    @State private var draft = ""
+    @FocusState private var fieldFocused: Bool
+
+    private var collapsed: Bool { compact && !expanded }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 title
-                Spacer()
-                Menu {
-                    if account.provider == .claude || account.provider == .codex {
-                        Button("重新登录") { Task { await store.addAccount(account.provider) } }
-                    }
-                    Button("移除", role: .destructive) { store.remove(account.id) }
-                } label: {
-                    Image(systemName: "ellipsis")
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
+                Spacer(minLength: 4)
+                if collapsed { summary }
+                menu
             }
-            if let usage = status?.usage {
-                ForEach(usage.limits) { LimitRow(limit: $0) }
-                if let note = usage.note {
-                    Text(note).font(.caption).foregroundStyle(.secondary)
-                }
-            } else if status == nil {
-                ProgressView().controlSize(.small)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                guard compact, !editing else { return }
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
             }
-            if let e = status?.error {
-                Text(e).font(.caption).foregroundStyle(.red)
-            }
+            if !collapsed { details }
         }
-        .padding(10)
+        .padding(compact ? 8 : 10)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8)
@@ -190,14 +191,83 @@ struct AccountCard: View {
         } isTargeted: { dropTargeted = $0 }
     }
 
+    private var menu: some View {
+        Menu {
+            Button("重命名…") {
+                draft = account.displayName
+                editing = true
+            }
+            if account.provider == .claude || account.provider == .codex {
+                Button("重新登录") { Task { await store.addAccount(account.provider) } }
+            }
+            Button("移除", role: .destructive) { store.remove(account.id) }
+        } label: {
+            Image(systemName: "ellipsis")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    @ViewBuilder private var details: some View {
+        if let usage = status?.usage {
+            ForEach(usage.limits) { LimitRow(limit: $0) }
+            if let note = usage.note {
+                Text(note).font(.caption).foregroundStyle(.secondary)
+            }
+        } else if status == nil {
+            ProgressView().controlSize(.small)
+        }
+        if let e = status?.error {
+            Text(e).font(.caption).foregroundStyle(.red)
+        }
+    }
+
+    /// Collapsed row: the first two windows (5-hour and weekly for most providers) as mini bars.
+    @ViewBuilder private var summary: some View {
+        if let usage = status?.usage {
+            if usage.limits.isEmpty, let note = usage.note {
+                Text(note).font(.caption2).foregroundStyle(.secondary)
+            }
+            ForEach(usage.limits.prefix(2)) { MiniBar(limit: $0) }
+        } else if status == nil {
+            ProgressView().controlSize(.mini)
+        }
+        if let e = status?.error {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(e)
+        }
+    }
+
     private var title: some View {
         HStack(spacing: 6) {
             ProviderLogo(provider: account.provider)
-            Text(account.name)
-                .font(.subheadline.weight(.semibold))
-                .blur(radius: hideName ? 6 : 0)
-                .animation(.easeInOut(duration: 0.2), value: hideName)
+            if editing {
+                TextField(account.name, text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .frame(maxWidth: 180)
+                    .focused($fieldFocused)
+                    .onSubmit(commitRename)
+                    .onExitCommand { editing = false }
+                    .onAppear { fieldFocused = true }
+                    .onChange(of: fieldFocused) { _, focused in
+                        if !focused, editing { commitRename() }
+                    }
+            } else {
+                Text(account.displayName)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .blur(radius: hideName ? 6 : 0)
+                    .animation(.easeInOut(duration: 0.2), value: hideName)
+                    .help(account.alias == nil || hideName ? "" : account.name)
+            }
         }
+    }
+
+    private func commitRename() {
+        store.rename(account.id, to: draft)
+        editing = false
     }
 }
 
@@ -208,7 +278,7 @@ struct LimitRow: View {
         TimelineView(.periodic(from: .now, by: 60)) { ctx in
             HStack(spacing: 8) {
                 Text(limit.title).font(.caption).frame(width: 84, alignment: .leading)
-                ProgressView(value: min(limit.percent, 100), total: 100).tint(color)
+                ProgressView(value: min(limit.percent, 100), total: 100).tint(limit.tint)
                 Text("\(Int(limit.percent.rounded()))%")
                     .font(.caption.monospacedDigit()).frame(width: 36, alignment: .trailing)
                 Text(limit.resetDate.flatMap { countdown(to: $0, now: ctx.date) } ?? "—")
@@ -216,10 +286,24 @@ struct LimitRow: View {
             }
         }
     }
+}
 
-    private var color: Color {
-        limit.percent >= 90 ? .red : limit.percent >= 70 ? .orange : .green
+struct MiniBar: View {
+    let limit: Limit
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ProgressView(value: min(limit.percent, 100), total: 100).tint(limit.tint).frame(width: 40)
+            Text("\(Int(limit.percent.rounded()))%")
+                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                .frame(width: 28, alignment: .trailing)
+        }
+        .help("\(limit.title) · \(limit.resetDate.flatMap { countdown(to: $0) }.map { "\($0)后重置" } ?? "无重置时间")")
     }
+}
+
+extension Limit {
+    var tint: Color { percent >= 90 ? .red : percent >= 70 ? .orange : .green }
 }
 
 struct ProviderLogo: View {
