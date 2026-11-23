@@ -142,7 +142,7 @@ struct UsagePanel: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             ScrollView {
-                VStack(spacing: compact ? 6 : 10) {
+                VStack(spacing: 6) {
                     ForEach(store.accounts) { account in
                         AccountCard(account: account, status: store.status[account.id], store: store,
                                     hideName: hideNames, compact: compact)
@@ -206,7 +206,7 @@ struct AccountCard: View {
     private var collapsed: Bool { compact && !expanded }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 title
                 Spacer(minLength: 4)
@@ -220,7 +220,8 @@ struct AccountCard: View {
             }
             if !collapsed { details }
         }
-        .padding(compact ? 8 : 10)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8)
